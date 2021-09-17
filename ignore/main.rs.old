@@ -1,0 +1,157 @@
+//! Default Compute@Edge template program.
+
+use fastly::http::{header, HeaderValue, Method, StatusCode};
+use fastly::{mime, Error, Request, Response, Body};
+use std::io::{Read, Write, BufRead};
+
+/// The name of a backend server associated with this service.
+///
+/// This should be changed to match the name of your own backend. See the the `Hosts` section of
+/// the Fastly WASM service UI for more information.
+const PRIMARY_BACKEND: &str = "primary_backend";
+
+/// The name of a second backend associated with this service.
+const SECONDARY_BACKEND: &str = "secondary_backend";
+
+/// The entry point for your application.
+///
+/// This function is triggered when your service receives a client request. It could be used to
+/// route based on the request properties (such as method or path), send the request to a backend,
+/// make completely new requests, and/or generate synthetic responses.
+///
+/// If `main` returns an error, a 500 error response will be delivered to the client.
+//#[fastly::main]
+//fn main(mut req: Request) -> Result<Response, Error> {
+fn main() -> Result<(), Error> {
+    // Make any desired changes to the client request.
+    let req = Request::from_client();
+    let req_clone = req.clone_without_body();
+    // Forward the downstream request to the backend
+    let mut be_resp = req.send(PRIMARY_BACKEND)?;
+    //let mut be_resp_clone = be_resp.clone_without_body();
+
+    if let Some(x) = be_resp.get_content_length() {
+        println!("Content Length fetched by C@E is {}", x);
+    }
+    // Take the body out of beresp and replace it with a new empty body that we can stream to
+    let mut num_lines = 1;
+
+    use std::borrow::Cow;
+    use fastly::http::Url;
+
+    let myurl = Url::parse(req_clone.get_url_str())?;
+    //let url = req.get_url_str().parse().unwrap();
+    let mut pairs = myurl.query_pairs();
+
+    // Only expecting one query param or none
+    match pairs.next() {
+        Some((Cow::Borrowed("path"), Cow::Borrowed("1"))) => {
+            let mut be_body = std::mem::replace(be_resp.get_body_mut(), Body::new());
+
+            // Send the response headers downstream, and get ahold of the streaming body
+            //let mut be_resp_copy = be_resp.clone_without_body();
+            let mut streaming_body = be_resp.stream_to_client();
+
+            /*let chunks = be_body.into_bytes();
+            //let client_body = Body::from(chunks.as_slice());
+            //let down_stream_resp = Response::from_parts(client_body).send_downstream();
+            //let down_stream_resp = fastly::Response::(client_body).send_to_client();
+            streaming_body.write(&chunks)?;
+            */
+
+            // Now we can read from `be_body` a 4KiB chunk at a time, add that chunk to the running
+            // checksum, and then write the chunk to the downstream body. Because we're only reading a chunk
+            // at a time, we are not in danger of exceeding our Wasm heap limits.
+
+            const CHUNK_SIZE: usize = 16384;
+            let mut chunk = [0; CHUNK_SIZE];
+            loop {
+                // Read from the backend body
+                let nread = be_body.read(&mut chunk)?;
+
+                // Slice just the bytes that were successfully read; it may be fewer than 4KiB
+                let chunk_read = &chunk[0..nread];
+                println!("Just read {} bytes in loop number {} ", nread, num_lines);
+
+                // Write the chunk to the streaming downstream body
+                streaming_body.write(chunk_read)?;
+
+                if nread < CHUNK_SIZE {
+                    // If there's more no body left, we're done
+                    break;
+                }
+                num_lines += 1;
+
+            }
+            println!("Path1: Loop ran {} times", num_lines);
+
+            // Drop the streaming body so the response will finish sending.
+            drop(streaming_body);
+        }
+        Some((Cow::Borrowed("path"), Cow::Borrowed("2"))) => {
+            //use http::StatusCode;
+
+            let mut be_body = std::mem::replace(be_resp.get_body_mut(), Body::new());
+            let mut range_val = "-1";
+            if let Some(x) = req_clone.get_header_str("range") {
+                range_val = x;
+                println!("Range val received is {}", range_val);
+                let pair: Vec<_> = range_val.split('=').collect();
+                println!("This is what was split {:?}", pair);
+                let val_pair: Vec<_> = pair[1].split('-').collect();
+                println!("This is what was split {:?}", val_pair);
+                println!("Range value from is {}", val_pair[0]);
+                range_val = val_pair[0];
+            }
+
+            let mut range_val_num = -1;
+            let mut line = range_val.to_string();
+            if let Some (x) = line
+                .trim()
+                .parse::<i32>().ok() {
+                    println!("Setting range value to {}", x);
+                    range_val_num = x;
+                }
+            println!("The range value requested is {}", range_val_num);
+            // Send the response headers downstream, and get ahold of the streaming body
+            //be_resp.set_status(StatusCode::from_u16(206));
+            //if (range_val_num == 0) | (range_val_num < be_resp.get_content_length().unwrap())  {
+            /*if range_val_num >= 0 && range_val_num < be_resp.get_content_length().unwrap() as i32  {
+                println!("Setting partial content");
+                be_resp.set_status(StatusCode::PARTIAL_CONTENT);
+                if range_val_num == 0 {
+                    //let val = format!("bytes 0-{}/{}", 4095, be_resp.get_content_length().unwrap());
+                    let local_be_resp = be_resp.clone_with_body();
+                    //let val = format!("bytes 0-{}/{}", local_be_resp.into_body_bytes().len(), be_resp.get_content_length().unwrap());
+                    //let val2 = format!("{}", be_resp.get_content_length().unwrap());
+                    //be_resp.set_header("Content-Length", val2);
+                    let val = format!("bytes 0-{}/{}", be_resp.get_content_length().unwrap()-1, be_resp.get_content_length().unwrap());
+                    be_resp.set_header("Content-Range", val);
+                }
+            }*/
+            //println!("Path2.0: Loop ran {} times", num_lines);
+            let mut streaming_body = be_resp.stream_to_client();
+            //println!("Path2.1: Loop ran {} times", num_lines);
+            for chunk in be_body.read_chunks(8192) {
+
+                let mut chunk = chunk.unwrap();
+                println!("Path2.2: Loop ran {} times with length written {}", num_lines, chunk.len());
+                //chunk.retain(|b| *b != 0);
+                streaming_body.write_bytes(&chunk);
+                num_lines += 1;
+            }
+            println!("Path2.3: Loop ran {} times", num_lines);
+
+            // Drop the streaming body so the response will finish sending.
+            drop(streaming_body);
+        }
+        None | Some(((_), _)) => {
+
+        }
+    }
+
+
+    // Done!
+
+    Ok(())
+}
